@@ -34,7 +34,6 @@ MENU_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-# признаки "цен"
 PRICE_RE = re.compile(
     r"(?<!\w)("
     r"(?:€|\$|£)\s?\d{1,4}(?:[.,]\d{1,2})?"
@@ -43,19 +42,26 @@ PRICE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Иногда цены пишутся как "12,-" или "12,50"
-PRICE_SIMPLE_RE = re.compile(r"\b\d{1,3}(?:[.,]\d{1,2})?\s?(?:€|eur|euro|₽|руб\.?|р\.?)\b", re.IGNORECASE)
-PRICE_BARE_RE = re.compile(r"\b\d{1,3}(?:[.,]\d{1,2})\b")  # осторожно: может ловить не цены
+BAD_TEXT_RE = re.compile(
+    r"^(?:войти|login|sign in|sign-in|register|sign up|signup|"
+    r"корзина|cart|basket|профиль|account|my account|search|поиск|"
+    r"privacy|cookie|terms|условия|language|язык)$",
+    re.IGNORECASE,
+)
+
 
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
+
 
 def get_reg_domain(url: str) -> str:
     e = tldextract.extract(url)
     return ".".join([p for p in [e.domain, e.suffix] if p]).lower()
 
+
 def is_internal(base_url: str, u: str) -> bool:
     return get_reg_domain(base_url) == get_reg_domain(u)
+
 
 def canonicalize_url(base_url: str, href: str) -> Optional[str]:
     if not href:
@@ -71,9 +77,11 @@ def canonicalize_url(base_url: str, href: str) -> Optional[str]:
         return None
     return abs_url
 
+
 def looks_like_file(path: str) -> bool:
     path = (path or "").lower()
     return any(path.endswith(ext) for ext in [".pdf", ".jpg", ".jpeg", ".png", ".webp", ".svg", ".zip", ".mp4"])
+
 
 def url_is_pdf(url: str) -> bool:
     return urlparse(url).path.lower().endswith(".pdf")
@@ -99,35 +107,23 @@ class RestaurantMenuScraper:
         self.sess.headers.update(DEFAULT_HEADERS)
 
     def fetch(self, url: str) -> Optional[requests.Response]:
-        last_err = None
         for attempt in range(self.retries + 1):
             try:
                 r = self.sess.get(url, timeout=self.timeout, allow_redirects=True)
                 if r.status_code >= 400:
-                    last_err = f"HTTP {r.status_code}"
                     time.sleep(0.2 * (attempt + 1))
                     continue
                 return r
-            except Exception as e:
-                last_err = str(e)
+            except Exception:
                 time.sleep(0.3 * (attempt + 1))
         return None
 
     def fetch_html(self, url: str) -> Optional[str]:
         r = self.fetch(url)
         time.sleep(self.sleep_sec)
-        if not r:
-            return None
-        # иногда content-type отсутствует/кривой — всё равно попробуем как html
-        return r.text
+        return r.text if r else None
 
     def collect_internal_pages(self, start_url: str, max_pages: int = 35) -> List[str]:
-        """
-        BFS по внутренним ссылкам, чтобы найти кандидатов меню.
-        """
-        if not re.match(r"^https?://", start_url, re.IGNORECASE):
-            start_url = "https://" + start_url
-
         q = [start_url]
         seen = {start_url}
         out = []
@@ -137,9 +133,10 @@ class RestaurantMenuScraper:
             html = self.fetch_html(url)
             if not html:
                 continue
-            out.append(url)
 
+            out.append(url)
             soup = BeautifulSoup(html, "lxml")
+
             for a in soup.select("a[href]"):
                 abs_url = canonicalize_url(url, a.get("href"))
                 if not abs_url:
@@ -148,25 +145,20 @@ class RestaurantMenuScraper:
                     continue
 
                 path = urlparse(abs_url).path
-                # не выкидываем pdf, он может быть меню — но не будем по нему BFS продолжать
+                # pdf оставляем как кандидат меню, но не углубляемся
                 if looks_like_file(path) and not url_is_pdf(abs_url):
                     continue
 
-                if abs_url not in seen:
+                if abs_url not in seen and len(seen) < max_pages * 12:
                     seen.add(abs_url)
                     q.append(abs_url)
 
         return out
 
     def find_menu_candidates(self, start_url: str, pages: List[str], max_candidates: int = 12) -> List[str]:
-        """
-        Отбираем URL-ы, которые похожи на страницу/файл меню:
-        - по анкор-текстам/URL (menu, speisekarte, drinks...)
-        - плюс анализ контента: много цен на странице
-        """
         candidates: Set[str] = set()
 
-        # 1) кандидаты из ссылок на страницах (по ключевым словам)
+        # 1) по ссылкам и анкорам
         for p in pages:
             html = self.fetch_html(p)
             if not html:
@@ -174,78 +166,58 @@ class RestaurantMenuScraper:
             soup = BeautifulSoup(html, "lxml")
             for a in soup.select("a[href]"):
                 text = norm_space(a.get_text(" ", strip=True))
-                href = a.get("href")
-                abs_url = canonicalize_url(p, href)
+                abs_url = canonicalize_url(p, a.get("href"))
                 if not abs_url:
                     continue
                 if not is_internal(start_url, abs_url):
                     continue
 
-                in_text = bool(text and MENU_KEYWORDS.search(text))
-                in_url = bool(MENU_KEYWORDS.search(abs_url))
-                if in_text or in_url:
+                if MENU_KEYWORDS.search(text) or MENU_KEYWORDS.search(abs_url):
                     candidates.add(abs_url)
 
-        # 2) если мало — добавим “типичные” пути
-        typical = ["/menu", "/menue", "/speisekarte", "/karte", "/food", "/drinks", "/bar", "/carta", "/carte", "/меню"]
-        for t in typical:
+        # 2) типичные пути (fallback)
+        for t in ["/menu", "/menue", "/speisekarte", "/karte", "/food", "/drinks", "/bar", "/carta", "/carte", "/меню"]:
             candidates.add(urljoin(start_url, t))
 
-        # 3) скоринг: страница меню обычно содержит много цен
+        # 3) скоринг (меню часто = много цен; PDF = супер-кандидат)
         scored: List[Tuple[int, str]] = []
         for u in list(candidates):
             r = self.fetch(u)
             time.sleep(self.sleep_sec)
             if not r:
                 continue
-            ctype = (r.headers.get("Content-Type") or "").lower()
 
+            ctype = (r.headers.get("Content-Type") or "").lower()
             if "application/pdf" in ctype or url_is_pdf(u):
-                # PDF меню — это прям очень сильный кандидат
                 scored.append((1000, u))
                 continue
 
-            # HTML/прочее
-            text = r.text
+            text = r.text or ""
             price_hits = len(PRICE_RE.findall(text))
-            kw_hits = len(MENU_KEYWORDS.findall((r.text[:20000] or "")))  # слегка
-            # лёгкий бонус, если url содержит menu
+            kw_hits = len(MENU_KEYWORDS.findall(text[:20000] or ""))
             url_bonus = 5 if MENU_KEYWORDS.search(u) else 0
             score = price_hits * 8 + kw_hits * 2 + url_bonus
             scored.append((score, u))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        # отбросим совсем слабые
         strong = [u for s, u in scored if s >= 25][:max_candidates]
-        # если вообще ничего сильного — вернём топ-3 как “best effort”
         return strong if strong else [u for _, u in scored[:3]]
-
-    # ----------------------------
-    # Извлечение позиций меню (HTML)
-    # ----------------------------
 
     def extract_from_html(self, start_url: str, source_url: str, html: str) -> List[MenuItem]:
         soup = BeautifulSoup(html, "lxml")
-
-        # уберём очевидный шум
         for t in soup(["script", "style", "noscript"]):
             t.decompose()
 
         site = urlparse(start_url).netloc
-
         items: List[MenuItem] = []
 
-        # 1) Попробуем структурные паттерны: таблицы/карточки/листы
-        # Ищем элементы, где есть цена и рядом текст
-        # Будем собирать по блокам, содержащим цену.
         price_nodes = []
-        for node in soup.find_all(text=PRICE_RE):
+        for node in soup.find_all(string=PRICE_RE):
             if isinstance(node, str):
                 price_nodes.append(node.parent)
 
         def nearest_block(tag: Tag) -> Tag:
             cur = tag
-            # поднимаемся до разумного контейнера
             for _ in range(4):
                 if not isinstance(cur, Tag):
                     break
@@ -271,20 +243,15 @@ class RestaurantMenuScraper:
             prices = PRICE_RE.findall(block_text)
             price = prices[0] if prices else None
 
-            # попытка выделить имя блюда:
-            # возьмём первый "сильный" текстовый кусок до цены
             before = block_text
             if price:
                 idx = before.find(price)
                 if idx > 0:
                     before = before[:idx].strip()
 
-            # имя — обычно первая фраза, описание — остаток
-            # разделим по " — " / ":" / "  " и т.п.
             name = None
             desc = None
 
-            # если внутри есть явный заголовок
             heading = block.find(["h1", "h2", "h3", "h4", "strong"])
             if heading:
                 htxt = norm_space(heading.get_text(" ", strip=True))
@@ -292,7 +259,6 @@ class RestaurantMenuScraper:
                     name = htxt
 
             if not name:
-                # fallback: первый “кусок” до разделителя
                 parts = re.split(r"\s[-–—:]\s|\s{2,}", before, maxsplit=1)
                 name = norm_space(parts[0])[:120] if parts and parts[0] else None
                 if len(parts) > 1:
@@ -301,7 +267,7 @@ class RestaurantMenuScraper:
             if not name or len(name) < 2:
                 continue
 
-            # категория (если есть ближайший заголовок выше по дереву)
+            # категория — ближайший h2/h3 выше
             cat = None
             parent = block
             for _ in range(6):
@@ -327,32 +293,27 @@ class RestaurantMenuScraper:
                 )
             )
 
-        # 2) Если почти ничего не нашли — fallback по строкам текста
+        # fallback по строкам
         if len(items) < 5:
             text = soup.get_text("\n", strip=True)
             lines = [norm_space(x) for x in text.splitlines() if norm_space(x)]
-            # простая эвристика: "Название ... 12,50 €"
             for ln in lines:
                 if not PRICE_RE.search(ln):
                     continue
                 price = PRICE_RE.findall(ln)[0]
                 before = ln.split(price)[0].strip()
-                if len(before) < 2 or len(before) > 120:
-                    continue
-                # отбросим явные “служебные” строки
-                if MENU_KEYWORDS.search(before) and len(before.split()) <= 2:
-                    continue
-                items.append(
-                    MenuItem(
-                        site=site,
-                        start_url=start_url,
-                        source_url=source_url,
-                        category=None,
-                        name=before,
-                        description=None,
-                        price=price,
+                if 2 <= len(before) <= 120 and not (MENU_KEYWORDS.search(before) and len(before.split()) <= 2):
+                    items.append(
+                        MenuItem(
+                            site=site,
+                            start_url=start_url,
+                            source_url=source_url,
+                            category=None,
+                            name=before,
+                            description=None,
+                            price=price,
+                        )
                     )
-                )
 
         # дедуп
         uniq = {}
@@ -362,15 +323,12 @@ class RestaurantMenuScraper:
                 uniq[key] = it
         return list(uniq.values())
 
-    # ----------------------------
-    # Извлечение из PDF (если текстовый)
-    # ----------------------------
-
     def extract_from_pdf(self, start_url: str, source_url: str, pdf_bytes: bytes) -> List[MenuItem]:
+        # опционально
         try:
+            import io
             import pdfplumber
         except Exception:
-            # если pdfplumber не установлен — просто не парсим
             return []
 
         site = urlparse(start_url).netloc
@@ -378,14 +336,14 @@ class RestaurantMenuScraper:
 
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             full_text = []
-            for page in pdf.pages[:20]:  # ограничение на очень большие pdf
+            for page in pdf.pages[:20]:
                 t = page.extract_text() or ""
                 if t:
                     full_text.append(t)
+
         text = "\n".join(full_text)
         lines = [norm_space(x) for x in text.splitlines() if norm_space(x)]
 
-        # базовая эвристика строк: "Dish .... 12,50 €"
         for ln in lines:
             if not PRICE_RE.search(ln):
                 continue
@@ -404,7 +362,6 @@ class RestaurantMenuScraper:
                     )
                 )
 
-        # дедуп
         uniq = {}
         for it in items:
             key = (it.source_url, it.name.lower(), it.price or "")
@@ -412,26 +369,22 @@ class RestaurantMenuScraper:
                 uniq[key] = it
         return list(uniq.values())
 
-    # ----------------------------
-    # Основной пайплайн
-    # ----------------------------
-
-    def scrape(self, start_url: str, max_pages: int = 35, max_menu_sources: int = 6) -> Tuple[List[MenuItem], Dict]:
+    def scrape_one(self, start_url: str, max_pages: int = 35, max_menu_sources: int = 6) -> Tuple[List[MenuItem], Dict]:
         if not re.match(r"^https?://", start_url, re.IGNORECASE):
             start_url = "https://" + start_url
 
         pages = self.collect_internal_pages(start_url, max_pages=max_pages)
         candidates = self.find_menu_candidates(start_url, pages, max_candidates=12)
 
-        diagnostics = {
+        diag = {
             "start_url": start_url,
+            "site": urlparse(start_url).netloc,
             "pages_crawled": len(pages),
             "menu_candidates_found": len(candidates),
             "menu_candidates": candidates[:max_menu_sources],
         }
 
         all_items: List[MenuItem] = []
-
         for src in candidates[:max_menu_sources]:
             r = self.fetch(src)
             time.sleep(self.sleep_sec)
@@ -440,33 +393,35 @@ class RestaurantMenuScraper:
 
             ctype = (r.headers.get("Content-Type") or "").lower()
             if "application/pdf" in ctype or url_is_pdf(src):
-                # PDF
-                try:
-                    # NOTE: PDF extraction uses io.BytesIO, import lazily
-                    global io
-                    import io  # noqa
-                    items = self.extract_from_pdf(start_url, src, r.content)
-                except Exception:
-                    items = []
+                items = self.extract_from_pdf(start_url, src, r.content)
             else:
-                items = self.extract_from_html(start_url, src, r.text)
+                items = self.extract_from_html(start_url, src, r.text or "")
 
             all_items.extend(items)
 
-        # финальная дедупликация по name+price+source_url
+        # финальная дедупликация
         uniq = {}
         for it in all_items:
-            key = (it.source_url, it.name.lower(), (it.price or "").strip())
+            key = (it.start_url, it.source_url, it.name.lower(), (it.price or "").strip())
             if key not in uniq:
                 uniq[key] = it
 
-        final_items = list(uniq.values())
-        diagnostics["items_extracted"] = len(final_items)
-
-        return final_items, diagnostics
+        diag["items_extracted"] = len(uniq)
+        return list(uniq.values()), diag
 
 
-def save(items: List[MenuItem], out_csv: str, out_jsonl: str) -> None:
+def read_sites(path: str) -> List[str]:
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            out.append(s)
+    return out
+
+
+def save_dataset(items: List[MenuItem], out_csv: str, out_jsonl: str) -> None:
     rows = []
     for it in items:
         rows.append({
@@ -478,6 +433,7 @@ def save(items: List[MenuItem], out_csv: str, out_jsonl: str) -> None:
             "description": it.description,
             "price": it.price,
         })
+
     df = pd.DataFrame(rows)
     df.to_csv(out_csv, index=False, encoding="utf-8")
 
@@ -486,25 +442,54 @@ def save(items: List[MenuItem], out_csv: str, out_jsonl: str) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+def save_diagnostics(diags: List[Dict], out_path: str) -> None:
+    with open(out_path, "w", encoding="utf-8") as f:
+        for d in diags:
+            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Restaurant menu discovery scraper (HTML/PDF) without Selenium.")
-    ap.add_argument("--url", required=True, help="Restaurant homepage URL (entry point).")
-    ap.add_argument("--max_pages", type=int, default=35, help="How many internal pages to sample.")
-    ap.add_argument("--max_menu_sources", type=int, default=6, help="How many menu sources to parse.")
+    ap = argparse.ArgumentParser(description="Batch restaurant menu scraper (HTML/PDF) without Selenium.")
+    ap.add_argument("--sites", required=True, help="Path to sites.txt (one homepage URL per line).")
+    ap.add_argument("--max_pages", type=int, default=35, help="Internal pages to sample per site.")
+    ap.add_argument("--max_menu_sources", type=int, default=6, help="Menu sources to parse per site.")
     ap.add_argument("--sleep", type=float, default=0.3, help="Sleep between requests.")
     ap.add_argument("--timeout", type=int, default=20, help="Request timeout.")
     ap.add_argument("--retries", type=int, default=2, help="Retries.")
-    ap.add_argument("--out_csv", default="restaurant_menu.csv", help="Output CSV.")
-    ap.add_argument("--out_jsonl", default="restaurant_menu.jsonl", help="Output JSONL.")
+    ap.add_argument("--out_csv", default="restaurants_menu.csv", help="Output CSV.")
+    ap.add_argument("--out_jsonl", default="restaurants_menu.jsonl", help="Output JSONL.")
+    ap.add_argument("--out_diag", default="restaurants_diag.jsonl", help="Diagnostics JSONL.")
     args = ap.parse_args()
 
+    sites = read_sites(args.sites)
     scraper = RestaurantMenuScraper(timeout=args.timeout, sleep_sec=args.sleep, retries=args.retries)
-    items, diag = scraper.scrape(args.url, max_pages=args.max_pages, max_menu_sources=args.max_menu_sources)
 
-    print(json.dumps(diag, ensure_ascii=False, indent=2))
-    print(f"Extracted items: {len(items)}")
-    save(items, args.out_csv, args.out_jsonl)
-    print(f"Saved: {args.out_csv}, {args.out_jsonl}")
+    all_items: List[MenuItem] = []
+    diags: List[Dict] = []
+
+    for i, s in enumerate(sites, 1):
+        try:
+            items, diag = scraper.scrape_one(
+                s,
+                max_pages=args.max_pages,
+                max_menu_sources=args.max_menu_sources,
+            )
+            all_items.extend(items)
+            diags.append(diag)
+            print(f"[{i}/{len(sites)}] {diag['start_url']} -> items: {diag['items_extracted']} | candidates: {diag['menu_candidates_found']}")
+        except Exception as e:
+            diags.append({
+                "start_url": s,
+                "site": urlparse("https://" + s if not s.startswith("http") else s).netloc,
+                "error": str(e),
+            })
+            print(f"[{i}/{len(sites)}] {s} -> ERROR: {e}")
+
+    save_dataset(all_items, args.out_csv, args.out_jsonl)
+    save_diagnostics(diags, args.out_diag)
+
+    print(f"Saved dataset: {args.out_csv}, {args.out_jsonl}")
+    print(f"Saved diagnostics: {args.out_diag}")
 
 
 if __name__ == "__main__":
