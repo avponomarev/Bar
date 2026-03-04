@@ -1,8 +1,16 @@
+# restaurant_menu_batch_fixed.py
+# Batch restaurant menu scraper (HTML/PDF/iframe) WITHOUT Selenium.
+# Input: sites.txt (one homepage per line)
+# Output:
+#   - restaurants_menu.csv / restaurants_menu.jsonl  (menu items)
+#   - restaurants_menu_sources.csv / .jsonl          (menu sources found even if items not extracted)
+#   - restaurants_diag.jsonl                         (diagnostics per site)
+
 import re
 import json
 import time
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple, Dict, Set
 from urllib.parse import urljoin, urlparse, urldefrag
 
@@ -22,6 +30,7 @@ DEFAULT_HEADERS = {
 
 BAD_SCHEMES = ("mailto:", "tel:", "javascript:")
 
+# Keywords to detect menu links (many languages)
 MENU_KEYWORDS = re.compile(
     r"\b("
     r"menu|our menu|food|drinks|wine|cocktail|bar|kitchen|"
@@ -34,6 +43,7 @@ MENU_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Price patterns (EUR/USD/GBP/RUB common)
 PRICE_RE = re.compile(
     r"(?<!\w)("
     r"(?:€|\$|£)\s?\d{1,4}(?:[.,]\d{1,2})?"
@@ -49,6 +59,17 @@ BAD_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Common “menu item” containers on many sites
+MENU_BLOCK_SELECTORS = [
+    ".menu-item", ".menu__item", ".menuItem", ".menuitem",
+    ".dish", ".dish-item", ".dishItem",
+    ".product", ".product-item", ".productItem",
+    ".item", ".card", ".cards__item",
+    "[class*='menu']", "[id*='menu']",
+    "[class*='dish']", "[class*='product']",
+    "tr", "li", "article", "section", "div"
+]
+
 
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
@@ -57,10 +78,6 @@ def norm_space(s: str) -> str:
 def get_reg_domain(url: str) -> str:
     e = tldextract.extract(url)
     return ".".join([p for p in [e.domain, e.suffix] if p]).lower()
-
-
-def is_internal(base_url: str, u: str) -> bool:
-    return get_reg_domain(base_url) == get_reg_domain(u)
 
 
 def canonicalize_url(base_url: str, href: str) -> Optional[str]:
@@ -78,13 +95,30 @@ def canonicalize_url(base_url: str, href: str) -> Optional[str]:
     return abs_url
 
 
-def looks_like_file(path: str) -> bool:
-    path = (path or "").lower()
-    return any(path.endswith(ext) for ext in [".pdf", ".jpg", ".jpeg", ".png", ".webp", ".svg", ".zip", ".mp4"])
-
-
 def url_is_pdf(url: str) -> bool:
     return urlparse(url).path.lower().endswith(".pdf")
+
+
+def looks_like_non_html_file(path: str) -> bool:
+    path = (path or "").lower()
+    return any(path.endswith(ext) for ext in [
+        ".jpg", ".jpeg", ".png", ".webp", ".svg", ".zip", ".mp4", ".mov", ".avi", ".mp3"
+    ])
+
+
+def is_internal_loose(start_url: str, u: str, allowed_netlocs: Set[str]) -> bool:
+    """
+    Loose internal check:
+    - allow same registrable domain
+    - also allow any netloc observed from redirects / start page
+    """
+    try:
+        netloc = urlparse(u).netloc.lower()
+    except Exception:
+        return False
+    if netloc in allowed_netlocs:
+        return True
+    return get_reg_domain(start_url) == get_reg_domain(u)
 
 
 @dataclass
@@ -98,8 +132,17 @@ class MenuItem:
     price: Optional[str]
 
 
+@dataclass
+class MenuSource:
+    site: str
+    start_url: str
+    source_url: str
+    source_type: str  # html / pdf / iframe / page_fallback
+    score: int
+
+
 class RestaurantMenuScraper:
-    def __init__(self, timeout: int = 20, sleep_sec: float = 0.3, retries: int = 2):
+    def __init__(self, timeout: int = 20, sleep_sec: float = 0.4, retries: int = 2):
         self.timeout = timeout
         self.sleep_sec = sleep_sec
         self.retries = retries
@@ -111,11 +154,11 @@ class RestaurantMenuScraper:
             try:
                 r = self.sess.get(url, timeout=self.timeout, allow_redirects=True)
                 if r.status_code >= 400:
-                    time.sleep(0.2 * (attempt + 1))
+                    time.sleep(0.25 * (attempt + 1))
                     continue
                 return r
             except Exception:
-                time.sleep(0.3 * (attempt + 1))
+                time.sleep(0.35 * (attempt + 1))
         return None
 
     def fetch_html(self, url: str) -> Optional[str]:
@@ -123,7 +166,45 @@ class RestaurantMenuScraper:
         time.sleep(self.sleep_sec)
         return r.text if r else None
 
-    def collect_internal_pages(self, start_url: str, max_pages: int = 35) -> List[str]:
+    def get_allowed_netlocs(self, start_url: str) -> Set[str]:
+        """
+        Fetch start_url once to capture redirects and allow www/non-www/m. variants.
+        """
+        allowed = set()
+        try:
+            r = self.fetch(start_url)
+            time.sleep(self.sleep_sec)
+            if r is None:
+                allowed.add(urlparse(start_url).netloc.lower())
+                return allowed
+
+            # final URL after redirects
+            final_url = r.url
+            allowed.add(urlparse(start_url).netloc.lower())
+            allowed.add(urlparse(final_url).netloc.lower())
+
+            # also allow www variant
+            nl = urlparse(final_url).netloc.lower()
+            if nl.startswith("www."):
+                allowed.add(nl[4:])
+            else:
+                allowed.add("www." + nl)
+
+            # allow m. variant
+            if nl.startswith("m."):
+                allowed.add(nl[2:])
+            else:
+                allowed.add("m." + nl)
+
+            return allowed
+        except Exception:
+            allowed.add(urlparse(start_url).netloc.lower())
+            return allowed
+
+    def collect_internal_pages(self, start_url: str, allowed_netlocs: Set[str], max_pages: int = 40) -> List[str]:
+        """
+        BFS crawl internal pages. Keeps PDFs as discovered links (handled later) but does not crawl into PDFs.
+        """
         q = [start_url]
         seen = {start_url}
         out = []
@@ -141,67 +222,178 @@ class RestaurantMenuScraper:
                 abs_url = canonicalize_url(url, a.get("href"))
                 if not abs_url:
                     continue
-                if not is_internal(start_url, abs_url):
+
+                # allow loose internal
+                if not is_internal_loose(start_url, abs_url, allowed_netlocs):
                     continue
 
                 path = urlparse(abs_url).path
-                # pdf оставляем как кандидат меню, но не углубляемся
-                if looks_like_file(path) and not url_is_pdf(abs_url):
+                # do not crawl into non-html files
+                if url_is_pdf(abs_url) or looks_like_non_html_file(path):
+                    if abs_url not in seen:
+                        seen.add(abs_url)
                     continue
 
-                if abs_url not in seen and len(seen) < max_pages * 12:
+                if abs_url not in seen and len(seen) < max_pages * 15:
                     seen.add(abs_url)
                     q.append(abs_url)
 
         return out
 
-    def find_menu_candidates(self, start_url: str, pages: List[str], max_candidates: int = 12) -> List[str]:
-        candidates: Set[str] = set()
+    def _score_url_as_menu_source(self, u: str, start_url: str) -> Optional[Tuple[int, str]]:
+        """
+        Returns (score, source_type) or None if not fetchable.
+        """
+        r = self.fetch(u)
+        time.sleep(self.sleep_sec)
+        if not r:
+            return None
 
-        # 1) по ссылкам и анкорам
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "application/pdf" in ctype or url_is_pdf(u):
+            return (2000, "pdf")
+
+        text = r.text or ""
+        price_hits = len(PRICE_RE.findall(text))
+        kw_hits_url = 1 if MENU_KEYWORDS.search(u) else 0
+        kw_hits_page = len(MENU_KEYWORDS.findall(text[:40000] or ""))
+
+        score = price_hits * 10 + kw_hits_page * 2 + kw_hits_url * 30
+        return (score, "html")
+
+    def find_menu_candidates(
+        self,
+        start_url: str,
+        pages: List[str],
+        allowed_netlocs: Set[str],
+        max_candidates: int = 12,
+        allow_external_iframes: bool = True,
+    ) -> Tuple[List[MenuSource], Dict]:
+        """
+        Wide menu source discovery:
+        - links by keywords
+        - all PDFs found anywhere
+        - iframes (often menu widgets; can be external)
+        - fallback: pick crawled pages with highest count of prices
+        Returns: (menu_sources_sorted, discovery_stats)
+        """
+        candidates: Set[str] = set()
+        pdfs: Set[str] = set()
+        iframes: Set[str] = set()
+
+        scanned_pages = 0
+
         for p in pages:
             html = self.fetch_html(p)
             if not html:
                 continue
+            scanned_pages += 1
             soup = BeautifulSoup(html, "lxml")
+
+            # anchor links
             for a in soup.select("a[href]"):
                 text = norm_space(a.get_text(" ", strip=True))
+                if BAD_TEXT_RE.match(text):
+                    continue
                 abs_url = canonicalize_url(p, a.get("href"))
                 if not abs_url:
                     continue
-                if not is_internal(start_url, abs_url):
+
+                # PDFs: keep even if no keywords
+                if url_is_pdf(abs_url):
+                    # mostly internal PDFs; external PDFs are less common but can exist
+                    if is_internal_loose(start_url, abs_url, allowed_netlocs):
+                        pdfs.add(abs_url)
                     continue
 
+                # internal pages
+                if not is_internal_loose(start_url, abs_url, allowed_netlocs):
+                    continue
+
+                # keyword hit => candidate
                 if MENU_KEYWORDS.search(text) or MENU_KEYWORDS.search(abs_url):
                     candidates.add(abs_url)
 
-        # 2) типичные пути (fallback)
+            # iframe sources (menu widgets)
+            for fr in soup.select("iframe[src]"):
+                src = canonicalize_url(p, fr.get("src"))
+                if not src:
+                    continue
+                if allow_external_iframes:
+                    iframes.add(src)
+                else:
+                    if is_internal_loose(start_url, src, allowed_netlocs):
+                        iframes.add(src)
+
+        # typical paths fallback
         for t in ["/menu", "/menue", "/speisekarte", "/karte", "/food", "/drinks", "/bar", "/carta", "/carte", "/меню"]:
             candidates.add(urljoin(start_url, t))
 
-        # 3) скоринг (меню часто = много цен; PDF = супер-кандидат)
-        scored: List[Tuple[int, str]] = []
-        for u in list(candidates):
-            r = self.fetch(u)
-            time.sleep(self.sleep_sec)
-            if not r:
+        # combine
+        candidates_all = set(candidates) | set(pdfs) | set(iframes)
+
+        scored: List[MenuSource] = []
+        scored_raw: List[Tuple[int, str]] = []
+
+        for u in candidates_all:
+            s = self._score_url_as_menu_source(u, start_url)
+            if s is None:
                 continue
+            score, stype = s
+            # Slight boost for iframe candidates so we don't miss widgets
+            if u in iframes and stype != "pdf":
+                score += 50
+                stype = "iframe"
+            if u in pdfs:
+                stype = "pdf"
+            scored.append(MenuSource(
+                site=urlparse(start_url).netloc,
+                start_url=start_url,
+                source_url=u,
+                source_type=stype,
+                score=int(score),
+            ))
+            scored_raw.append((int(score), u))
 
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            if "application/pdf" in ctype or url_is_pdf(u):
-                scored.append((1000, u))
-                continue
+        # sort by score desc
+        scored.sort(key=lambda x: x.score, reverse=True)
 
-            text = r.text or ""
-            price_hits = len(PRICE_RE.findall(text))
-            kw_hits = len(MENU_KEYWORDS.findall(text[:20000] or ""))
-            url_bonus = 5 if MENU_KEYWORDS.search(u) else 0
-            score = price_hits * 8 + kw_hits * 2 + url_bonus
-            scored.append((score, u))
+        # keep strong ones first
+        strong = [ms for ms in scored if ms.score >= 20][:max_candidates]
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        strong = [u for s, u in scored if s >= 25][:max_candidates]
-        return strong if strong else [u for _, u in scored[:3]]
+        # if none strong: fallback to pages with most prices
+        fallback_sources: List[MenuSource] = []
+        if not strong:
+            page_price_scores: List[Tuple[int, str]] = []
+            for p in pages:
+                html = self.fetch_html(p)
+                if not html:
+                    continue
+                ph = len(PRICE_RE.findall(html))
+                page_price_scores.append((ph, p))
+            page_price_scores.sort(key=lambda x: x[0], reverse=True)
+            for ph, p in page_price_scores[:3]:
+                if ph <= 0:
+                    continue
+                fallback_sources.append(MenuSource(
+                    site=urlparse(start_url).netloc,
+                    start_url=start_url,
+                    source_url=p,
+                    source_type="page_fallback",
+                    score=int(ph * 10),
+                ))
+
+        final_sources = strong if strong else fallback_sources
+
+        stats = {
+            "pages_total": len(pages),
+            "pages_scanned_for_sources": scanned_pages,
+            "candidates_kw": len(candidates),
+            "candidates_pdfs": len(pdfs),
+            "candidates_iframes": len(iframes),
+            "candidates_total_unique": len(candidates_all),
+        }
+        return final_sources, stats
 
     def extract_from_html(self, start_url: str, source_url: str, html: str) -> List[MenuItem]:
         soup = BeautifulSoup(html, "lxml")
@@ -211,6 +403,66 @@ class RestaurantMenuScraper:
         site = urlparse(start_url).netloc
         items: List[MenuItem] = []
 
+        # 0) Try common block selectors first (higher recall)
+        for sel in MENU_BLOCK_SELECTORS:
+            try:
+                blocks = soup.select(sel)
+            except Exception:
+                continue
+            # avoid scanning absurd amounts
+            for block in blocks[:600]:
+                txt = norm_space(block.get_text(" ", strip=True))
+                if not txt or len(txt) < 8:
+                    continue
+                if not PRICE_RE.search(txt):
+                    continue
+
+                price = PRICE_RE.findall(txt)[0]
+                before = txt.split(price)[0].strip()
+                if not before:
+                    continue
+
+                # get a likely name
+                name = None
+                h = block.find(["h1", "h2", "h3", "h4", "strong"])
+                if h:
+                    htxt = norm_space(h.get_text(" ", strip=True))
+                    if 2 <= len(htxt) <= 100:
+                        name = htxt
+
+                if not name:
+                    # split common separators
+                    parts = re.split(r"\s[-–—:]\s|\s{2,}", before, maxsplit=1)
+                    name = norm_space(parts[0])[:120] if parts else before[:120]
+
+                if not name or len(name) < 2:
+                    continue
+
+                # category: nearest previous h2/h3
+                cat = None
+                parent = block
+                for _ in range(6):
+                    if not isinstance(parent, Tag):
+                        break
+                    prev = parent.find_previous(["h2", "h3"])
+                    if prev:
+                        c = norm_space(prev.get_text(" ", strip=True))
+                        if c and len(c) <= 60:
+                            cat = c
+                            break
+                    parent = parent.parent
+
+                items.append(MenuItem(
+                    site=site,
+                    start_url=start_url,
+                    source_url=source_url,
+                    category=cat,
+                    name=name,
+                    description=None,
+                    price=price
+                ))
+
+        # 1) Second pass: blocks around price nodes (helps with sparse markup)
         price_nodes = []
         for node in soup.find_all(string=PRICE_RE):
             if isinstance(node, str):
@@ -218,7 +470,7 @@ class RestaurantMenuScraper:
 
         def nearest_block(tag: Tag) -> Tag:
             cur = tag
-            for _ in range(4):
+            for _ in range(5):
                 if not isinstance(cur, Tag):
                     break
                 if cur.name in {"li", "tr", "article", "section", "div"}:
@@ -240,60 +492,38 @@ class RestaurantMenuScraper:
             if not block_text:
                 continue
 
-            prices = PRICE_RE.findall(block_text)
-            price = prices[0] if prices else None
+            price = PRICE_RE.findall(block_text)[0] if PRICE_RE.search(block_text) else None
+            if not price:
+                continue
 
             before = block_text
-            if price:
-                idx = before.find(price)
-                if idx > 0:
-                    before = before[:idx].strip()
-
-            name = None
-            desc = None
+            idx = before.find(price)
+            if idx > 0:
+                before = before[:idx].strip()
 
             heading = block.find(["h1", "h2", "h3", "h4", "strong"])
+            name = None
             if heading:
                 htxt = norm_space(heading.get_text(" ", strip=True))
-                if htxt and len(htxt) <= 80:
+                if 2 <= len(htxt) <= 100:
                     name = htxt
-
             if not name:
                 parts = re.split(r"\s[-–—:]\s|\s{2,}", before, maxsplit=1)
                 name = norm_space(parts[0])[:120] if parts and parts[0] else None
-                if len(parts) > 1:
-                    desc = norm_space(parts[1])[:400]
-
             if not name or len(name) < 2:
                 continue
 
-            # категория — ближайший h2/h3 выше
-            cat = None
-            parent = block
-            for _ in range(6):
-                if not isinstance(parent, Tag):
-                    break
-                prev = parent.find_previous(["h2", "h3"])
-                if prev:
-                    c = norm_space(prev.get_text(" ", strip=True))
-                    if c and len(c) <= 60:
-                        cat = c
-                        break
-                parent = parent.parent
+            items.append(MenuItem(
+                site=site,
+                start_url=start_url,
+                source_url=source_url,
+                category=None,
+                name=name,
+                description=None,
+                price=price
+            ))
 
-            items.append(
-                MenuItem(
-                    site=site,
-                    start_url=start_url,
-                    source_url=source_url,
-                    category=cat,
-                    name=name,
-                    description=desc,
-                    price=price,
-                )
-            )
-
-        # fallback по строкам
+        # 2) Fallback: line-based extraction
         if len(items) < 5:
             text = soup.get_text("\n", strip=True)
             lines = [norm_space(x) for x in text.splitlines() if norm_space(x)]
@@ -303,28 +533,25 @@ class RestaurantMenuScraper:
                 price = PRICE_RE.findall(ln)[0]
                 before = ln.split(price)[0].strip()
                 if 2 <= len(before) <= 120 and not (MENU_KEYWORDS.search(before) and len(before.split()) <= 2):
-                    items.append(
-                        MenuItem(
-                            site=site,
-                            start_url=start_url,
-                            source_url=source_url,
-                            category=None,
-                            name=before,
-                            description=None,
-                            price=price,
-                        )
-                    )
+                    items.append(MenuItem(
+                        site=site,
+                        start_url=start_url,
+                        source_url=source_url,
+                        category=None,
+                        name=before,
+                        description=None,
+                        price=price
+                    ))
 
-        # дедуп
-        uniq = {}
+        # Deduplicate
+        uniq: Dict[Tuple[str, str, str], MenuItem] = {}
         for it in items:
-            key = (it.source_url, (it.category or "").lower(), it.name.lower(), (it.price or ""))
+            key = (it.source_url, it.name.lower(), (it.price or "").strip())
             if key not in uniq:
                 uniq[key] = it
         return list(uniq.values())
 
     def extract_from_pdf(self, start_url: str, source_url: str, pdf_bytes: bytes) -> List[MenuItem]:
-        # опционально
         try:
             import io
             import pdfplumber
@@ -334,80 +561,103 @@ class RestaurantMenuScraper:
         site = urlparse(start_url).netloc
         items: List[MenuItem] = []
 
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            full_text = []
-            for page in pdf.pages[:20]:
-                t = page.extract_text() or ""
-                if t:
-                    full_text.append(t)
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                full_text = []
+                for page in pdf.pages[:25]:
+                    t = page.extract_text() or ""
+                    if t:
+                        full_text.append(t)
+            text = "\n".join(full_text)
+        except Exception:
+            return []
 
-        text = "\n".join(full_text)
-        lines = [norm_space(x) for x in text.splitlines() if norm_space(x)]
-
+        lines = [norm_space(x) for x in (text or "").splitlines() if norm_space(x)]
         for ln in lines:
             if not PRICE_RE.search(ln):
                 continue
             price = PRICE_RE.findall(ln)[0]
             before = ln.split(price)[0].strip(" .•-–—:\t")
             if 2 <= len(before) <= 120:
-                items.append(
-                    MenuItem(
-                        site=site,
-                        start_url=start_url,
-                        source_url=source_url,
-                        category=None,
-                        name=before,
-                        description=None,
-                        price=price,
-                    )
-                )
+                items.append(MenuItem(
+                    site=site,
+                    start_url=start_url,
+                    source_url=source_url,
+                    category=None,
+                    name=before,
+                    description=None,
+                    price=price
+                ))
 
-        uniq = {}
+        uniq: Dict[Tuple[str, str], MenuItem] = {}
         for it in items:
-            key = (it.source_url, it.name.lower(), it.price or "")
+            key = (it.name.lower(), (it.price or "").strip())
             if key not in uniq:
                 uniq[key] = it
         return list(uniq.values())
 
-    def scrape_one(self, start_url: str, max_pages: int = 35, max_menu_sources: int = 6) -> Tuple[List[MenuItem], Dict]:
+    def scrape_one(
+        self,
+        start_url_raw: str,
+        max_pages: int = 40,
+        max_menu_sources: int = 6,
+        allow_external_iframes: bool = True,
+    ) -> Tuple[List[MenuItem], List[MenuSource], Dict]:
+        # normalize URL
+        start_url = start_url_raw.strip()
         if not re.match(r"^https?://", start_url, re.IGNORECASE):
             start_url = "https://" + start_url
 
-        pages = self.collect_internal_pages(start_url, max_pages=max_pages)
-        candidates = self.find_menu_candidates(start_url, pages, max_candidates=12)
+        allowed_netlocs = self.get_allowed_netlocs(start_url)
+
+        pages = self.collect_internal_pages(start_url, allowed_netlocs, max_pages=max_pages)
+
+        sources, src_stats = self.find_menu_candidates(
+            start_url=start_url,
+            pages=pages,
+            allowed_netlocs=allowed_netlocs,
+            max_candidates=12,
+            allow_external_iframes=allow_external_iframes,
+        )
+
+        sources_top = sources[:max_menu_sources]
 
         diag = {
             "start_url": start_url,
             "site": urlparse(start_url).netloc,
+            "allowed_netlocs": sorted(list(allowed_netlocs))[:10],
             "pages_crawled": len(pages),
-            "menu_candidates_found": len(candidates),
-            "menu_candidates": candidates[:max_menu_sources],
+            "menu_sources_found": len(sources),
+            "menu_sources_top": [asdict(s) for s in sources_top],
+            "source_discovery": src_stats,
         }
 
         all_items: List[MenuItem] = []
-        for src in candidates[:max_menu_sources]:
-            r = self.fetch(src)
+
+        for src in sources_top:
+            r = self.fetch(src.source_url)
             time.sleep(self.sleep_sec)
             if not r:
                 continue
 
             ctype = (r.headers.get("Content-Type") or "").lower()
-            if "application/pdf" in ctype or url_is_pdf(src):
-                items = self.extract_from_pdf(start_url, src, r.content)
+
+            if "application/pdf" in ctype or url_is_pdf(src.source_url):
+                items = self.extract_from_pdf(start_url, src.source_url, r.content)
             else:
-                items = self.extract_from_html(start_url, src, r.text or "")
+                items = self.extract_from_html(start_url, src.source_url, r.text or "")
 
             all_items.extend(items)
 
-        # финальная дедупликация
-        uniq = {}
+        # Final dedup across sources
+        uniq: Dict[Tuple[str, str, str], MenuItem] = {}
         for it in all_items:
-            key = (it.start_url, it.source_url, it.name.lower(), (it.price or "").strip())
+            key = (it.start_url, it.name.lower(), (it.price or "").strip())
             if key not in uniq:
                 uniq[key] = it
 
         diag["items_extracted"] = len(uniq)
-        return list(uniq.values()), diag
+        return list(uniq.values()), sources_top, diag
 
 
 def read_sites(path: str) -> List[str]:
@@ -421,22 +671,19 @@ def read_sites(path: str) -> List[str]:
     return out
 
 
-def save_dataset(items: List[MenuItem], out_csv: str, out_jsonl: str) -> None:
-    rows = []
-    for it in items:
-        rows.append({
-            "site": it.site,
-            "start_url": it.start_url,
-            "source_url": it.source_url,
-            "category": it.category,
-            "name": it.name,
-            "description": it.description,
-            "price": it.price,
-        })
-
+def save_items(items: List[MenuItem], out_csv: str, out_jsonl: str) -> None:
+    rows = [asdict(it) for it in items]
     df = pd.DataFrame(rows)
     df.to_csv(out_csv, index=False, encoding="utf-8")
+    with open(out_jsonl, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+
+def save_sources(sources: List[MenuSource], out_csv: str, out_jsonl: str) -> None:
+    rows = [asdict(s) for s in sources]
+    df = pd.DataFrame(rows)
+    df.to_csv(out_csv, index=False, encoding="utf-8")
     with open(out_jsonl, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -449,15 +696,18 @@ def save_diagnostics(diags: List[Dict], out_path: str) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Batch restaurant menu scraper (HTML/PDF) without Selenium.")
+    ap = argparse.ArgumentParser(description="Batch restaurant menu scraper (HTML/PDF/iframe) without Selenium.")
     ap.add_argument("--sites", required=True, help="Path to sites.txt (one homepage URL per line).")
-    ap.add_argument("--max_pages", type=int, default=35, help="Internal pages to sample per site.")
-    ap.add_argument("--max_menu_sources", type=int, default=6, help="Menu sources to parse per site.")
-    ap.add_argument("--sleep", type=float, default=0.3, help="Sleep between requests.")
+    ap.add_argument("--max_pages", type=int, default=40, help="Internal pages to crawl per site.")
+    ap.add_argument("--max_menu_sources", type=int, default=6, help="How many menu sources to parse per site.")
+    ap.add_argument("--sleep", type=float, default=0.4, help="Sleep between requests.")
     ap.add_argument("--timeout", type=int, default=20, help="Request timeout.")
     ap.add_argument("--retries", type=int, default=2, help="Retries.")
-    ap.add_argument("--out_csv", default="restaurants_menu.csv", help="Output CSV.")
-    ap.add_argument("--out_jsonl", default="restaurants_menu.jsonl", help="Output JSONL.")
+    ap.add_argument("--allow_external_iframes", action="store_true", help="Allow external iframe menu widgets (recommended).")
+    ap.add_argument("--out_csv", default="restaurants_menu.csv", help="Output menu items CSV.")
+    ap.add_argument("--out_jsonl", default="restaurants_menu.jsonl", help="Output menu items JSONL.")
+    ap.add_argument("--out_sources_csv", default="restaurants_menu_sources.csv", help="Output menu sources CSV.")
+    ap.add_argument("--out_sources_jsonl", default="restaurants_menu_sources.jsonl", help="Output menu sources JSONL.")
     ap.add_argument("--out_diag", default="restaurants_diag.jsonl", help="Diagnostics JSONL.")
     args = ap.parse_args()
 
@@ -465,30 +715,41 @@ def main():
     scraper = RestaurantMenuScraper(timeout=args.timeout, sleep_sec=args.sleep, retries=args.retries)
 
     all_items: List[MenuItem] = []
+    all_sources: List[MenuSource] = []
     diags: List[Dict] = []
 
     for i, s in enumerate(sites, 1):
         try:
-            items, diag = scraper.scrape_one(
+            items, sources, diag = scraper.scrape_one(
                 s,
                 max_pages=args.max_pages,
                 max_menu_sources=args.max_menu_sources,
+                allow_external_iframes=args.allow_external_iframes,
             )
             all_items.extend(items)
+            all_sources.extend(sources)
             diags.append(diag)
-            print(f"[{i}/{len(sites)}] {diag['start_url']} -> items: {diag['items_extracted']} | candidates: {diag['menu_candidates_found']}")
+
+            print(
+                f"[{i}/{len(sites)}] {diag['start_url']} | "
+                f"pages={diag['pages_crawled']} sources={diag['menu_sources_found']} "
+                f"items={diag['items_extracted']}"
+            )
         except Exception as e:
+            url_norm = s if s.startswith("http") else ("https://" + s)
             diags.append({
-                "start_url": s,
-                "site": urlparse("https://" + s if not s.startswith("http") else s).netloc,
+                "start_url": url_norm,
+                "site": urlparse(url_norm).netloc,
                 "error": str(e),
             })
             print(f"[{i}/{len(sites)}] {s} -> ERROR: {e}")
 
-    save_dataset(all_items, args.out_csv, args.out_jsonl)
+    save_items(all_items, args.out_csv, args.out_jsonl)
+    save_sources(all_sources, args.out_sources_csv, args.out_sources_jsonl)
     save_diagnostics(diags, args.out_diag)
 
-    print(f"Saved dataset: {args.out_csv}, {args.out_jsonl}")
+    print(f"Saved menu items: {args.out_csv}, {args.out_jsonl}")
+    print(f"Saved menu sources: {args.out_sources_csv}, {args.out_sources_jsonl}")
     print(f"Saved diagnostics: {args.out_diag}")
 
 
