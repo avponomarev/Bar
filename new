@@ -1,0 +1,406 @@
+import re
+import time
+import json
+import argparse
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Set
+from urllib.parse import urljoin, urlparse, urldefrag
+
+import requests
+import pandas as pd
+import tldextract
+from bs4 import BeautifulSoup, Tag
+
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru,en;q=0.8",
+}
+
+BAD_SCHEMES = ("mailto:", "tel:", "javascript:")
+
+# Тексты, которые часто не относятся к меню разделов (можно расширять)
+BAD_TEXT_RE = re.compile(
+    r"^(?:войти|login|sign in|sign-in|register|sign up|signup|"
+    r"корзина|cart|basket|профиль|account|my account|search|поиск|"
+    r"privacy|cookie|terms|условия|language|язык)$",
+    re.IGNORECASE,
+)
+
+
+def norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def get_reg_domain(url: str) -> str:
+    e = tldextract.extract(url)
+    return ".".join([p for p in [e.domain, e.suffix] if p]).lower()
+
+
+def is_internal(base_url: str, candidate_url: str) -> bool:
+    return get_reg_domain(base_url) == get_reg_domain(candidate_url)
+
+
+def canonicalize_url(base_url: str, href: str) -> Optional[str]:
+    if not href:
+        return None
+    href = href.strip()
+    low = href.lower()
+    if any(low.startswith(s) for s in BAD_SCHEMES):
+        return None
+
+    abs_url = urljoin(base_url, href)
+    abs_url, _ = urldefrag(abs_url)  # убрать якорь
+
+    # отфильтровать мусорные "страницы"
+    parsed = urlparse(abs_url)
+    if parsed.scheme not in ("http", "https"):
+        return None
+    return abs_url
+
+
+def url_key_for_signature(url: str) -> str:
+    """
+    Нормализуем URL для сравнения блоков:
+    - берём только path (без query) как более стабильный идентификатор,
+      но оставляем домен, чтобы не путать внешние ссылки.
+    """
+    p = urlparse(url)
+    # query часто шумит (utm и т.п.), поэтому отбрасываем
+    return f"{p.netloc.lower()}{p.path.rstrip('/') or '/'}"
+
+
+def extract_links(container: Tag, base_url: str) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    seen = set()
+
+    for a in container.select("a[href]"):
+        href = a.get("href")
+        abs_url = canonicalize_url(base_url, href)
+        if not abs_url:
+            continue
+
+        text = norm_space(a.get_text(" ", strip=True))
+        if not text:
+            text = norm_space(a.get("aria-label") or a.get("title") or "")
+        if not text:
+            continue
+
+        if BAD_TEXT_RE.match(text):
+            continue
+
+        k = (text.lower(), abs_url)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append((text, abs_url))
+
+    return out
+
+
+def candidate_containers(soup: BeautifulSoup) -> List[Tag]:
+    """
+    Берём широкую сетку контейнеров — меню может быть где угодно.
+    Дальше будем фильтровать по “много ссылок” + повторяемость.
+    """
+    tags = []
+    for name in ["nav", "header", "footer", "aside", "section", "div"]:
+        tags.extend(soup.find_all(name))
+    # Плюс списки — часто меню это ul/ol
+    tags.extend(soup.find_all(["ul", "ol"]))
+    # Дедуп по id объекта
+    uniq = []
+    seen = set()
+    for t in tags:
+        tid = id(t)
+        if tid not in seen:
+            uniq.append(t)
+            seen.add(tid)
+    return uniq
+
+
+@dataclass
+class BlockSignature:
+    keys: Tuple[str, ...]          # нормализованные url_key
+    items: Tuple[Tuple[str, str], ...]  # (text, abs_url) для сохранения
+    page_url: str
+    container_hint: str            # nav/header/footer/... для дебага
+
+
+def container_hint(tag: Tag) -> str:
+    parts = [tag.name or ""]
+    role = (tag.get("role") or "").strip()
+    if role:
+        parts.append(f'role={role}')
+    _id = (tag.get("id") or "").strip()
+    if _id:
+        parts.append(f"id={_id}")
+    cls = tag.get("class")
+    if isinstance(cls, list) and cls:
+        parts.append("class=" + ".".join(cls[:3]))
+    return "|".join(parts)
+
+
+def block_signature(tag: Tag, base_url: str, min_links: int = 5) -> Optional[BlockSignature]:
+    links = extract_links(tag, base_url)
+    if len(links) < min_links:
+        return None
+
+    # Слишком огромные блоки часто футер/сайтмап — не выкидываем полностью,
+    # но ограничим, чтобы сигнатура не стала “всё подряд”.
+    links_trim = links[:120]
+
+    keys = tuple(sorted({url_key_for_signature(u) for _, u in links_trim}))
+    if len(keys) < min_links:
+        return None
+
+    return BlockSignature(
+        keys=keys,
+        items=tuple(links_trim),
+        page_url=base_url,
+        container_hint=container_hint(tag),
+    )
+
+
+def jaccard(a: Set[str], b: Set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    uni = len(a | b)
+    return inter / uni if uni else 0.0
+
+
+class SiteMenuDiscoverer:
+    def __init__(
+        self,
+        timeout: int = 20,
+        sleep_sec: float = 0.3,
+        max_retries: int = 2,
+    ):
+        self.timeout = timeout
+        self.sleep_sec = sleep_sec
+        self.max_retries = max_retries
+        self.sess = requests.Session()
+        self.sess.headers.update(DEFAULT_HEADERS)
+
+    def fetch_html(self, url: str) -> Optional[str]:
+        last_err = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                r = self.sess.get(url, timeout=self.timeout, allow_redirects=True)
+                if r.status_code >= 400:
+                    last_err = f"HTTP {r.status_code}"
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                return r.text
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(0.3 * (attempt + 1))
+        return None
+
+    def collect_pages(self, start_url: str, max_pages: int = 25) -> List[str]:
+        """
+        BFS по внутренним ссылкам, начиная с главной.
+        """
+        start_url = canonicalize_url(start_url, start_url) or start_url
+        q = [start_url]
+        seen = set([start_url])
+        out = []
+
+        while q and len(out) < max_pages:
+            url = q.pop(0)
+            html = self.fetch_html(url)
+            time.sleep(self.sleep_sec)
+            if not html:
+                continue
+
+            out.append(url)
+            soup = BeautifulSoup(html, "lxml")
+
+            # соберём внутренние ссылки как кандидаты страниц
+            for a in soup.select("a[href]"):
+                abs_url = canonicalize_url(url, a.get("href"))
+                if not abs_url:
+                    continue
+                if not is_internal(start_url, abs_url):
+                    continue
+
+                # можно отсекать очевидные “файлы”
+                p = urlparse(abs_url).path.lower()
+                if any(p.endswith(ext) for ext in [".pdf", ".jpg", ".png", ".zip", ".mp4", ".svg"]):
+                    continue
+
+                if abs_url not in seen and len(seen) < max_pages * 8:
+                    seen.add(abs_url)
+                    q.append(abs_url)
+
+        return out
+
+    def extract_signatures_from_page(self, page_url: str, min_links: int = 5) -> List[BlockSignature]:
+        html = self.fetch_html(page_url)
+        time.sleep(self.sleep_sec)
+        if not html:
+            return []
+
+        soup = BeautifulSoup(html, "lxml")
+        sigs: List[BlockSignature] = []
+        for tag in candidate_containers(soup):
+            sig = block_signature(tag, page_url, min_links=min_links)
+            if sig:
+                sigs.append(sig)
+        return sigs
+
+    def discover_menu(
+        self,
+        start_url: str,
+        max_pages: int = 25,
+        min_links: int = 5,
+        similarity_threshold: float = 0.72,
+    ) -> Dict:
+        """
+        Возвращает:
+        - menu_items: список пунктов меню (text,url)
+        - diagnostics: как нашли
+        """
+        pages = self.collect_pages(start_url, max_pages=max_pages)
+        if not pages:
+            return {"menu_items": [], "diagnostics": {"reason": "no_pages"}}
+
+        # Для каждой страницы возьмём сигнатуры блоков
+        per_page_sigs: Dict[str, List[BlockSignature]] = {}
+        for p in pages:
+            per_page_sigs[p] = self.extract_signatures_from_page(p, min_links=min_links)
+
+        # Соберём все блоки в список
+        all_sigs = [s for lst in per_page_sigs.values() for s in lst]
+        if not all_sigs:
+            return {"menu_items": [], "diagnostics": {"reason": "no_candidates"}}
+
+        # Кластеризация по похожести:
+        # будем строить кластеры “похожих меню”, выбирая лидера и присоединяя похожие.
+        clusters = []
+        used = [False] * len(all_sigs)
+
+        sig_sets = [set(s.keys) for s in all_sigs]
+
+        for i, sig in enumerate(all_sigs):
+            if used[i]:
+                continue
+            used[i] = True
+            cluster = [i]
+            for j in range(i + 1, len(all_sigs)):
+                if used[j]:
+                    continue
+                if jaccard(sig_sets[i], sig_sets[j]) >= similarity_threshold:
+                    used[j] = True
+                    cluster.append(j)
+            clusters.append(cluster)
+
+        # Оценка кластера: сколько разных страниц он покрывает
+        def cluster_score(idxs: List[int]) -> Tuple[int, int]:
+            pages_covered = len({all_sigs[k].page_url for k in idxs})
+            avg_len = int(sum(len(all_sigs[k].keys) for k in idxs) / max(1, len(idxs)))
+            return (pages_covered, avg_len)
+
+        clusters.sort(key=lambda c: cluster_score(c), reverse=True)
+        best = clusters[0]
+        best_pages_covered, best_avg_len = cluster_score(best)
+
+        # Возьмём “представителя” — блок с максимальным числом ссылок внутри лучшего кластера
+        rep_idx = max(best, key=lambda k: len(all_sigs[k].keys))
+        rep = all_sigs[rep_idx]
+
+        # Сформируем итоговое меню: объединение ссылок из кластера (но сохраняем текст)
+        # Текст может отличаться — берём самый частый текст для каждого url_key
+        urlkey_to_text_counts: Dict[str, Dict[str, int]] = {}
+        urlkey_to_absurl: Dict[str, str] = {}
+
+        for k in best:
+            for text, abs_url in all_sigs[k].items:
+                uk = url_key_for_signature(abs_url)
+                urlkey_to_absurl[uk] = abs_url
+                urlkey_to_text_counts.setdefault(uk, {})
+                tnorm = norm_space(text)
+                urlkey_to_text_counts[uk][tnorm] = urlkey_to_text_counts[uk].get(tnorm, 0) + 1
+
+        menu_items = []
+        for uk, texts in urlkey_to_text_counts.items():
+            best_text = sorted(texts.items(), key=lambda x: x[1], reverse=True)[0][0]
+            menu_items.append((best_text, urlkey_to_absurl[uk]))
+
+        # Отсортируем: сначала внутренние, потом внешние; внутри — по алфавиту текста
+        menu_items.sort(key=lambda x: (0 if is_internal(start_url, x[1]) else 1, x[0].lower()))
+
+        diagnostics = {
+            "start_url": start_url,
+            "pages_crawled": len(pages),
+            "candidates_total": len(all_sigs),
+            "clusters": len(clusters),
+            "best_cluster_size": len(best),
+            "best_pages_covered": best_pages_covered,
+            "best_avg_len": best_avg_len,
+            "representative_container_hint": rep.container_hint,
+            "representative_page": rep.page_url,
+            "similarity_threshold": similarity_threshold,
+            "min_links": min_links,
+        }
+
+        return {"menu_items": menu_items, "diagnostics": diagnostics}
+
+
+def save_dataset(start_url: str, result: Dict, out_csv: str, out_jsonl: str) -> None:
+    site = urlparse(start_url).netloc
+    rows = []
+    for text, url in result["menu_items"]:
+        rows.append({
+            "site": site,
+            "start_url": start_url,
+            "item_text": text,
+            "item_url": url,
+        })
+
+    df = pd.DataFrame(rows)
+    df.to_csv(out_csv, index=False, encoding="utf-8")
+
+    with open(out_jsonl, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Discover site-wide menu by multi-page scraping (no Selenium).")
+    ap.add_argument("--url", required=True, help="Main page URL (entry point).")
+    ap.add_argument("--max_pages", type=int, default=25, help="How many internal pages to sample.")
+    ap.add_argument("--min_links", type=int, default=6, help="Min links in a candidate block.")
+    ap.add_argument("--sim", type=float, default=0.72, help="Jaccard similarity threshold for clustering.")
+    ap.add_argument("--sleep", type=float, default=0.3, help="Sleep between requests.")
+    ap.add_argument("--timeout", type=int, default=20, help="Request timeout.")
+    ap.add_argument("--retries", type=int, default=2, help="Retries.")
+    ap.add_argument("--out_csv", default="menu.csv", help="Output CSV.")
+    ap.add_argument("--out_jsonl", default="menu.jsonl", help="Output JSONL.")
+    args = ap.parse_args()
+
+    url = args.url
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        url = "https://" + url
+
+    d = SiteMenuDiscoverer(timeout=args.timeout, sleep_sec=args.sleep, max_retries=args.retries)
+    result = d.discover_menu(
+        start_url=url,
+        max_pages=args.max_pages,
+        min_links=args.min_links,
+        similarity_threshold=args.sim,
+    )
+
+    print("Diagnostics:", json.dumps(result["diagnostics"], ensure_ascii=False, indent=2))
+    print(f"Menu items: {len(result['menu_items'])}")
+
+    save_dataset(url, result, args.out_csv, args.out_jsonl)
+    print(f"Saved: {args.out_csv}, {args.out_jsonl}")
+
+
+if __name__ == "__main__":
+    main()
